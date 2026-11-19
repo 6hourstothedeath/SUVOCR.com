@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f172a">
+<meta name="description" content="OCR-блокнот: фото → текст → проверка орфографии → отправка на почту">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>OCR-блокнот</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◫</span>
+    <div>
+      <h1>OCR-блокнот</h1>
+      <p id="subtitle">фото → текст → почта</p>
+    </div>
+  </div>
+  <button id="btnSettings" class="icon-btn" title="Настройки" aria-label="Настройки">⚙</button>
+</header>
+
+<main id="app">
+  <!-- ЭКРАН 1: съёмка / выбор -->
+  <section id="screen-capture" class="screen active">
+    <div class="actions">
+      <label class="big-btn camera" for="fileCamera">
+        <span class="big-ico">📷</span>
+        <span class="big-title">Снять страницы</span>
+        <span class="big-sub">камера, можно несколько раз</span>
+      </label>
+      <input id="fileCamera" type="file" accept="image/*" capture="environment" multiple hidden>
+
+      <label class="big-btn gallery" for="fileGallery">
+        <span class="big-ico">🖼</span>
+        <span class="big-title">Из галереи</span>
+        <span class="big-sub">выбрать сразу несколько фото</span>
+      </label>
+      <input id="fileGallery" type="file" accept="image/*" multiple hidden>
+    </div>
+
+    <div class="hint" id="emptyHint">
+      Добавьте фотографии страниц — они выстроятся по порядку.
+      Порядок можно менять стрелками: от него зависит склейка абзацев между страницами.
+    </div>
+
+    <ul id="pageList" class="page-list"></ul>
+
+    <div class="sticky-actions" id="runBar" hidden>
+      <button id="btnRun" class="primary">Распознать <span id="runCount">0</span> стр.</button>
+      <button id="btnClear" class="ghost">Очистить</button>
+    </div>
+  </section>
+
+  <!-- ЭКРАН 2: результат -->
+  <section id="screen-result" class="screen">
+    <div class="result-toolbar">
+      <button id="btnBack" class="ghost">← Страницы</button>
+      <div class="spacer"></div>
+      <button id="btnSpell" class="chip">Проверить</button>
+      <button id="btnShare" class="chip">На почту</button>
+      <button id="btnCopy" class="chip">Копировать</button>
+    </div>
+
+    <div id="progressWrap" class="progress-wrap" hidden>
+      <div class="progress-bar"><div id="progressFill"></div></div>
+      <div id="progressText" class="progress-text">Подготовка…</div>
+    </div>
+
+    <div id="issuesPanel" class="issues" hidden>
+      <div class="issues-head">
+        <strong id="issuesTitle">Найдено: 0</strong>
+        <div class="spacer"></div>
+        <button id="btnApplyAll" class="chip small">Исправить все</button>
+        <button id="btnCloseIssues" class="chip small">Закрыть</button>
+      </div>
+      <ul id="issuesList"></ul>
+    </div>
+
+    <textarea id="result" spellcheck="false" placeholder="Здесь появится распознанный текст…"></textarea>
+
+    <details class="options">
+      <summary>Параметры текста</summary>
+      <label class="row"><input type="checkbox" id="optMerge" checked> Склеивать абзац, разорванный между страницами</label>
+      <label class="row"><input type="checkbox" id="optReflow" checked> Убирать переносы строк внутри абзаца</label>
+      <label class="row"><input type="checkbox" id="optEmpty" checked> Пустая строка между абзацами</label>
+      <label class="row"><input type="checkbox" id="optPageMarks" > Помечать границы страниц «--- стр. N ---»</label>
+      <div class="row"><button id="btnRebuild" class="chip">Пересобрать текст</button></div>
+    </details>
+
+    <p class="stats" id="stats"></p>
+  </section>
+</main>
+
+<!-- НАСТРОЙКИ -->
+<dialog id="dlgSettings">
+  <form method="dialog" class="settings">
+    <h2>Настройки</h2>
+
+    <label class="field">
+      <span>Языки распознавания</span>
+      <select id="setLangs">
+        <option value="rus+eng">Русский + английский</option>
+        <option value="rus">Только русский</option>
+        <option value="eng">Только английский</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>Длинная сторона фото при распознавании</span>
+      <select id="setMaxSide">
+        <option value="1400">1400 px — быстрее</option>
+        <option value="1800" selected>1800 px — баланс</option>
+        <option value="2400">2400 px — точнее</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>Проверка ошибок через API</span>
+      <select id="setSpeller">
+        <option value="yandex">Яндекс.Спеллер (орфография, ru)</option>
+        <option value="languagetool">LanguageTool (орфография + грамматика)</option>
+        <option value="both">Оба (сначала Яндекс, потом LanguageTool)</option>
+        <option value="off">Не проверять</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>Отправка на почту</span>
+      <select id="setMail">
+        <option value="auto">Авто: короткий текст — письмом, длинный — файлом</option>
+        <option value="share">Через «Поделиться» → почтовое приложение (файл .txt)</option>
+        <option value="mailto">Прямая ссылка mailto (текст в письме)</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>Адрес получателя</span>
+      <input id="setMailTo" type="email" placeholder="you@example.com" autocomplete="email" value="itsmyocrbitches@gmail.com">
+    </label>
+
+    <div class="dialog-actions">
+      <button value="cancel" class="ghost">Отмена</button>
+      <button id="btnSaveSettings" value="ok" class="primary">Сохранить</button>
+    </div>
+    <p class="fineprint">Языки и модель OCR хранятся на телефоне: после первой загрузки приложение работает без интернета. Проверка ошибок требует сети.</p>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="vendor/tesseract.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
