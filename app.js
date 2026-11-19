@@ -873,9 +873,21 @@ function buildSheets() {
     const paragraphs = (page.paragraphs || [])
       .map((p) => p.lines.join(' ').trim())
       .filter(Boolean);
-    if (!paragraphs.length) continue;
 
     if (textRows.length) textRows.push(['']);   // новая страница — с новой строки
+
+    // если на странице есть строки с несколькими ячейками — переносим построчно,
+    // чтобы столбцы не склеивались в один абзац; иначе — по абзацу в ячейку
+    const multiRows = rows.filter((row) => row.cells.length >= 2).length;
+
+    if (rows.length && multiRows >= 3) {
+      for (const row of rows) {
+        if (row.cells.length >= 2) textRows.push(row.cells.map((c) => c.text));
+        else textRows.push([row.cells[0] ? row.cells[0].text : '']);
+      }
+      continue;
+    }
+
     for (const paragraph of paragraphs) {
       for (const chunk of splitLongText(paragraph)) textRows.push([chunk]);
     }
