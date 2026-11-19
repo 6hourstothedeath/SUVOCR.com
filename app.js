@@ -501,11 +501,18 @@ function paragraphsFromLines(lines) {
   const heights = items.map((i) => i.bbox.y1 - i.bbox.y0).sort((a, b) => a - b);
   const medianH = heights[Math.floor(heights.length / 2)] || 20;
 
+  const gaps = [];
+  for (let i = 1; i < items.length; i++) {
+    gaps.push(Math.max(0, items[i].bbox.y0 - items[i - 1].bbox.y1));
+  }
+  const k = Number(window.__paraK) || 1.6;
+  const threshold = Math.max(medianH * k, 4);
+
   const groups = [];
   let cur = [];
   for (const item of items) {
     const prev = cur[cur.length - 1];
-    if (prev && item.bbox.y0 - prev.bbox.y1 > medianH * 0.7) {
+    if (prev && item.bbox.y0 - prev.bbox.y1 > threshold) {
       groups.push(cur);
       cur = [];
     }
