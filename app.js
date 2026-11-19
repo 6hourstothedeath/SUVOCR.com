@@ -82,6 +82,7 @@ async function idbPut(page) {
     const rec = {
       id: page.id, seq: page.seq, name: page.name, blob: page.blob,
       text: page.text || '', paragraphs: page.paragraphs || [],
+      lines: page.lines || [],
       conf: page.conf || 0, status: page.status || 'pending',
     };
     await new Promise((res, rej) => {
@@ -562,6 +563,10 @@ async function runOCR() {
         const result = await PaddleEngine.recognizeCanvas(canvas);
 
         page.paragraphs = paragraphsFromLines(result.lines);
+        page.lines = result.lines.map((l) => ({
+          t: l.text,
+          b: [l.bbox.x0, l.bbox.y0, l.bbox.x1, l.bbox.y1],
+        }));
         page.text = page.paragraphs.map((p) => p.lines.join('\n')).join('\n\n');
         page.conf = Math.round((result.meanScore || 0) * 100);
         page.status = page.text.trim() ? 'done' : 'error';
@@ -725,6 +730,154 @@ function rebuildText() {
   const pages = state.pages.filter((p) => p.status === 'done').length;
   el.stats.textContent = `Страниц: ${pages} · абзацев: ${blocks.length} · слов: ${words} · символов: ${chars}`;
   return text;
+}
+
+/* ------------------------------------------------------------------ */
+/* Экспорт в Excel                                                     */
+/* ------------------------------------------------------------------ */
+function medianOf(values) {
+  if (!values.length) return 0;
+  const s = values.slice().sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+/* строки страницы: ячейки, выровненные по вертикали */
+function rowsFromLines(lines) {
+  const items = (lines || [])
+    .map((l) => ({ text: String(l.t || '').replace(/\s+/g, ' ').trim(), x0: l.b[0], y0: l.b[1], x1: l.b[2], y1: l.b[3] }))
+    .filter((i) => i.text && i.x1 > i.x0);
+  if (!items.length) return [];
+
+  items.sort((a, b) => (a.y0 - b.y0) || (a.x0 - b.x0));
+  const h = medianOf(items.map((i) => i.y1 - i.y0)) || 20;
+
+  const rows = [];
+  for (const item of items) {
+    const last = rows[rows.length - 1];
+    let sameRow = false;
+    if (last) {
+      // та же строка, если рамки заметно перекрываются по вертикали
+      for (const cell of last.cells) {
+        const overlap = Math.min(cell.y1, item.y1) - Math.max(cell.y0, item.y0);
+        const minH = Math.min(cell.y1 - cell.y0, item.y1 - item.y0);
+        if (overlap > minH * 0.5) { sameRow = true; break; }
+      }
+    }
+    if (sameRow) {
+      last.cells.push(item);
+    } else {
+      rows.push({ center: (item.y0 + item.y1) / 2, cells: [item] });
+    }
+  }
+  rows.forEach((r) => r.cells.sort((a, b) => a.x0 - b.x0));
+  return rows;
+}
+
+/* похоже ли содержимое страницы на таблицу */
+function looksLikeTable(rows) {
+  if (rows.length < 4) return false;
+  const multi = rows.filter((r) => r.cells.length >= 2).length;
+  if (multi / rows.length >= 0.45) return true;
+
+  let run = 0;
+  for (const row of rows) {
+    run = row.cells.length >= 3 ? run + 1 : 0;
+    if (run >= 3) return true;
+  }
+  return false;
+}
+
+/* раскладываем ячейки по колонкам, сохраняя конфигурацию таблицы */
+function gridFromRows(rows, lineHeight) {
+  const starts = [];
+  for (const row of rows) for (const cell of row.cells) starts.push(cell.x0);
+  starts.sort((a, b) => a - b);
+
+  const cols = [];
+  for (const x of starts) {
+    if (!cols.length || x - cols[cols.length - 1] > lineHeight * 1.2) cols.push(x);
+  }
+
+  const grid = rows.map((row) => {
+    const cells = new Array(cols.length).fill('');
+    for (const cell of row.cells) {
+      let best = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < cols.length; i++) {
+        const d = Math.abs(cell.x0 - cols[i]);
+        if (d < bestDist) { bestDist = d; best = i; }
+      }
+      cells[best] = cells[best] ? `${cells[best]} ${cell.text}` : cell.text;
+    }
+    return cells;
+  });
+
+  // не тянем пустые ячейки вправо: у текстовых строк остаётся один столбец
+  return grid.map((row) => {
+    let end = row.length;
+    while (end > 0 && !row[end - 1]) end--;
+    return row.slice(0, Math.max(1, end));
+  });
+}
+
+/* собираем листы: таблица — сеткой, текст — по абзацу в ячейке */
+function buildSheets() {
+  const textRows = [];
+  const tableRows = [];
+  let tablePages = 0;
+
+  for (const page of state.pages) {
+    if (page.status !== 'done') continue;
+
+    const paragraphs = (page.paragraphs || []).map((p) => p.lines.join(' ').trim()).filter(Boolean);
+    const rows = rowsFromLines(page.lines || []);
+    const lineHeight = medianOf((page.lines || []).map((l) => l.b[3] - l.b[1])) || 20;
+
+    if (rows.length && looksLikeTable(rows)) {
+      tablePages++;
+      if (tableRows.length) tableRows.push([]);
+      tableRows.push(...gridFromRows(rows, lineHeight));
+      continue;   // таблица уже содержит весь текст страницы построчно
+    }
+    for (const text of paragraphs) textRows.push([text]);
+  }
+
+  const sheets = [];
+  const cleanTable = tableRows.filter((row) => row.length && row.some((cell) => cell));
+  if (cleanTable.length) sheets.push({ name: 'Таблица', rows: cleanTable });
+  if (textRows.length) sheets.push({ name: 'Текст', rows: textRows, width: 100 });
+  return { sheets, tablePages };
+}
+
+function xlsxBlob() {
+  const { sheets, tablePages } = buildSheets();
+  if (!sheets.length) return null;
+  const bytes = Xlsx.build(sheets);
+  return {
+    blob: new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+    sheets,
+    tablePages,
+  };
+}
+
+function xlsxName() {
+  return safeName().replace(/\.txt$/, '.xlsx');
+}
+
+function downloadXlsx() {
+  const built = xlsxBlob();
+  if (!built) { toast('Нет распознанного текста', true); return; }
+  const url = URL.createObjectURL(built.blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = xlsxName();
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+
+  const parts = built.sheets.map((s) => `${s.name}: ${s.rows.length} стр.`).join(', ');
+  toast(`Excel готов — ${parts}`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -969,19 +1122,22 @@ async function shareToMail() {
     return;
   }
 
-  const file = new File([text], safeName(), { type: 'text/plain;charset=utf-8' });
+  const built = xlsxBlob();
+  const file = built
+    ? new File([built.blob], xlsxName(), { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    : new File([text], safeName(), { type: 'text/plain;charset=utf-8' });
   const payload = { files: [file], title: 'Распознанный текст', text: text.slice(0, 300) };
   try {
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
       await navigator.share(payload);
       toast('Отправлено');
     } else {
-      downloadText(text);
+      if (built) downloadXlsx(); else downloadText(text);
       toast('Файл сохранён — прикрепите его в письме', false);
     }
   } catch (err) {
     if (err && err.name === 'AbortError') return;
-    downloadText(text);
+    if (built) downloadXlsx(); else downloadText(text);
     toast('Файл сохранён — прикрепите его в письме');
   }
 }
@@ -1069,6 +1225,7 @@ function bind() {
 
   $('#btnBack').addEventListener('click', () => showScreen('capture'));
   $('#btnSpell').addEventListener('click', runSpellcheck);
+  $('#btnExcel').addEventListener('click', downloadXlsx);
   $('#btnShare').addEventListener('click', shareToMail);
   $('#btnCopy').addEventListener('click', copyText);
   $('#btnRebuild').addEventListener('click', rebuildText);
@@ -1107,6 +1264,7 @@ async function restore() {
       url: URL.createObjectURL(row.blob),
       text: row.text || '',
       paragraphs: row.paragraphs || [],
+      lines: row.lines || [],
       conf: row.conf || 0,
       status: row.status || 'pending',
       error: '',
@@ -1139,6 +1297,9 @@ window.__app = {
   text: () => el.result.value,
   setText: (t) => { el.result.value = t; },
   openResult,
+  buildSheets,
+  xlsxBlob,
+  downloadXlsx,
   settings,
 };
 

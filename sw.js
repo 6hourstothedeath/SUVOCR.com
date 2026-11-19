@@ -5,6 +5,7 @@ const SHELL = [
   './index.html',
   './style.css',
   './app.js',
+  './xlsx.js',
   './paddle-engine.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
