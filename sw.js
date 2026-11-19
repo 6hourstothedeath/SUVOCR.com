@@ -1,10 +1,11 @@
 /* Service worker: офлайн-оболочка + кэш движка и языковых моделей */
-const VERSION = 'ocr-v1';
+const VERSION = 'ocr-v2';
 const SHELL = [
   './',
   './index.html',
   './style.css',
   './app.js',
+  './paddle-engine.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

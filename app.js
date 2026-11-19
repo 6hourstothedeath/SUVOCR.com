@@ -1,5 +1,5 @@
 /* OCR-блокнот — PWA для распознавания текста с фотографий.
- * Всё считается на телефоне: tesseract.js (WASM) + локальные языковые модели.
+ * Всё считается на телефоне: PaddleOCR (PP-OCRv5) в onnxruntime-web.
  * Проверка ошибок — внешние API (Яндекс.Спеллер / LanguageTool).
  */
 'use strict';
@@ -58,8 +58,7 @@ const state = {
   pages: [],       // { id, seq, name, blob, url, text, paragraphs, conf, status, error }
   busy: false,
   seq: 1,
-  worker: null,
-  workerLangs: null,
+  engineReady: false,
   issues: [],
 };
 
@@ -327,7 +326,9 @@ async function blobToCanvas(blob) {
 /* Выравнивание наклона делаем ПОСЛЕ поворота: на боком снимке оценка врёт */
 function deskewCanvas(canvas) {
   const angle = estimateSkew(canvas);
-  return Math.abs(angle) > 0.3 ? rotateCanvas(canvas, -angle) : canvas;
+  window.__lastSkew = angle;
+  // мелкий наклон (до ~0.8°) детектор переносит сам, а лишний ресемплинг только мылит текст
+  return Math.abs(angle) > 0.8 ? rotateCanvas(canvas, -angle) : canvas;
 }
 
 /* Оценка наклона страницы по проекции строк: перебираем углы и ищем максимум
@@ -402,58 +403,36 @@ async function rotateBlob(blob, degrees) {
 
 /* Быстрый «пробник» ориентации: распознаём уменьшенную копию в 0° и 180°
  * и выбираем вариант, где текст увереннее и его больше. Полный проход — один. */
-async function downscaleBlob(blob, side) {
-  const bmp = await createImageBitmap(blob);
-  const scale = Math.min(1, side / Math.max(bmp.width, bmp.height));
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.round(bmp.width * scale));
-  canvas.height = Math.max(1, Math.round(bmp.height * scale));
-  const ctx = canvas.getContext('2d');
+function downscaleCanvas(canvas, side) {
+  const scale = Math.min(1, side / Math.max(canvas.width, canvas.height));
+  const out = document.createElement('canvas');
+  out.width = Math.max(1, Math.round(canvas.width * scale));
+  out.height = Math.max(1, Math.round(canvas.height * scale));
+  const ctx = out.getContext('2d');
   ctx.fillStyle = '#fff';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-  if (bmp.close) bmp.close();
-  return await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(canvas, 0, 0, out.width, out.height);
+  return out;
 }
 
-async function scoreOrientation(worker, small, degrees) {
-  const prepared = degrees ? await rotateBlob(small, degrees) : small;
-  const { data } = await worker.recognize(prepared, {}, { text: true });
-  const words = (data.text || '').split(/\s+/).filter((w) => w.length > 2).length;
-  return (data.confidence || 0) + Math.min(words, 250) * 0.08;
-}
-
-/* Проверяем ориентации по очереди и останавливаемся, как только текст уверенный.
- * Для обычной вертикальной страницы это один быстрый проход. */
-async function detectOrientation(worker, prepared) {
-  const small = await downscaleBlob(prepared, 1000);
-  const tried = [];
-  let best = null;
-
-  for (const degrees of [0, 180, 90, 270]) {
-    if (best && best.score >= 80) break;
-    state.progressLabel = `${state.progressLabel} · ориентация`;
-    const score = await scoreOrientation(worker, small, degrees);
-    tried.push({ degrees, score });
-    if (!best || score > best.score) best = { degrees, score };
-  }
-
-  window.__probe = tried.map((t) => ({ deg: t.degrees, score: Math.round(t.score) }));
-  return best.score >= 45 ? best.degrees : 0;
+/* поворот canvas на 90/180/270 с перестановкой сторон */
+function rotateCanvasAny(canvas, degrees) {
+  const swap = degrees === 90 || degrees === 270;
+  const out = document.createElement('canvas');
+  out.width = swap ? canvas.height : canvas.width;
+  out.height = swap ? canvas.width : canvas.height;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.translate(out.width / 2, out.height / 2);
+  ctx.rotate((degrees * Math.PI) / 180);
+  ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
-/* OCR                                                                 */
+/* OCR: PaddleOCR PP-OCRv5 (DB + кириллический распознаватель)          */
 /* ------------------------------------------------------------------ */
-function ocrLogger(msg) {
-  if (!msg) return;
-  if (msg.status === 'recognizing text') {
-    setProgress(msg.progress || 0, `${state.progressLabel} · ${Math.round((msg.progress || 0) * 100)}%`);
-  } else if (msg.status) {
-    setProgress(null, `${state.progressLabel} · ${msg.status}`);
-  }
-}
-
 function setProgress(ratio, text) {
   el.progressWrap.hidden = false;
   if (ratio == null) {
@@ -464,26 +443,36 @@ function setProgress(ratio, text) {
   if (text) el.progressText.textContent = text;
 }
 
-async function getWorker() {
-  const langs = settings.langs;
-  if (state.worker && state.workerLangs === langs) return state.worker;
-  if (state.worker) {
-    try { await state.worker.terminate(); } catch {}
-    state.worker = null;
-  }
+async function getEngine() {
+  if (state.engineReady) return true;
   state.progressLabel = 'Загрузка движка';
-  setProgress(0, 'Загрузка движка OCR…');
-  const worker = await Tesseract.createWorker(langs, 1, {
-    workerPath: 'vendor/worker.min.js',
-    corePath: 'vendor/core',
-    langPath: 'vendor/lang',
-    gzip: false,
-    logger: ocrLogger,
-    errorHandler: (e) => console.error('tesseract', e),
-  });
-  state.worker = worker;
-  state.workerLangs = langs;
-  return worker;
+  setProgress(0, 'Загрузка движка OCR (PaddleOCR)…');
+  await PaddleEngine.init();
+  state.engineReady = true;
+  return true;
+}
+
+/* Какая сторона у страницы: гоняем уменьшенную копию и смотрим,
+ * где текста больше и он увереннее. */
+async function probeOrientation(canvas) {
+  const small = downscaleCanvas(canvas, 720);
+  const tried = [];
+  let best = null;
+
+  for (const degrees of [0, 180, 90, 270]) {
+    if (best && best.score >= 90) break;
+    state.progressLabel = `${state.progressLabel} · ориентация`;
+    const target = degrees ? rotateCanvasAny(small, degrees) : small;
+    const res = await PaddleEngine.recognizeCanvas(target);
+    const letters = res.lines.reduce(
+      (n, l) => n + (l.text.match(/[\p{L}\p{N}]/gu) || []).length, 0);
+    const score = Math.round(letters * res.meanScore);
+    tried.push({ deg: degrees, score });
+    if (!best || score > best.score) best = { deg: degrees, score };
+  }
+
+  window.__probe = tried;
+  return best.score >= 20 ? best.deg : 0;
 }
 
 function splitHeading(lines) {
@@ -497,62 +486,37 @@ function splitHeading(lines) {
   return [[first], lines.slice(1)];
 }
 
-function splitByGaps(lines) {
-  // адаптивный порог: сравниваем разрыв с медианным межстрочным интервалом,
-  // иначе наклон/перспектива фото ломают разбивку
-  const gaps = [];
-  for (let i = 1; i < lines.length; i++) {
-    const p = lines[i - 1].bbox;
-    const c = lines[i].bbox;
-    if (p && c) gaps.push(Math.max(0, c.y0 - p.y1));
-  }
-  const sorted = gaps.slice().sort((a, b) => a - b);
-  const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+/* Строки от детектора → абзацы по вертикальным разрывам */
+function paragraphsFromLines(lines) {
+  const items = (lines || [])
+    .map((l) => ({
+      text: String(l.text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim(),
+      bbox: l.bbox,
+    }))
+    .filter((x) => x.text && x.bbox);
 
-  const out = [];
+  if (!items.length) return [];
+  items.sort((a, b) => (a.bbox.y0 - b.bbox.y0) || (a.bbox.x0 - b.bbox.x0));
+
+  const heights = items.map((i) => i.bbox.y1 - i.bbox.y0).sort((a, b) => a - b);
+  const medianH = heights[Math.floor(heights.length / 2)] || 20;
+
+  const groups = [];
   let cur = [];
-  for (let i = 0; i < lines.length; i++) {
-    const prev = lines[i - 1];
-    const item = lines[i];
-    if (cur.length && prev && prev.bbox && item.bbox) {
-      const h = Math.max(1, prev.bbox.y1 - prev.bbox.y0);
-      const gap = item.bbox.y0 - prev.bbox.y1;
-      const threshold = Math.max(h * 0.5, median * 1.45);
-      if (gap > threshold) { out.push(cur); cur = []; }
+  for (const item of items) {
+    const prev = cur[cur.length - 1];
+    if (prev && item.bbox.y0 - prev.bbox.y1 > medianH * 0.7) {
+      groups.push(cur);
+      cur = [];
     }
     cur.push(item);
   }
-  if (cur.length) out.push(cur);
-  return out;
-}
+  if (cur.length) groups.push(cur);
 
-function extractParagraphs(data) {
   const paras = [];
-  for (const block of data.blocks || []) {
-    for (const p of block.paragraphs || []) {
-      const lines = (p.lines || [])
-        .map((l) => ({
-          text: (l.text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim(),
-          bbox: l.bbox || null,
-        }))
-        .filter((x) => x.text);
-      if (!lines.length) continue;
-      const conf = typeof p.confidence === 'number' ? p.confidence : 0;
-      for (const group of splitByGaps(lines)) {
-        for (const part of splitHeading(group.map((x) => x.text))) {
-          if (part.length) paras.push({ lines: part, conf });
-        }
-      }
-    }
-  }
-  if (!paras.length) {
-    const raw = (data.text || '').replace(/\r/g, '');
-    const chunks = raw.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean);
-    for (const chunk of chunks) {
-      const lines = chunk.split('\n').map((s) => s.trim()).filter(Boolean);
-      for (const part of splitHeading(lines)) {
-        if (part.length) paras.push({ lines: part, conf: data.confidence || 0 });
-      }
+  for (const group of groups) {
+    for (const part of splitHeading(group.map((x) => x.text))) {
+      if (part.length) paras.push({ lines: part, conf: 0 });
     }
   }
   return paras;
@@ -570,7 +534,7 @@ async function runOCR() {
   setProgress(0, 'Подготовка…');
 
   try {
-    const worker = await getWorker();
+    await getEngine();
     let done = 0;
 
     for (const page of todo) {
@@ -579,20 +543,20 @@ async function runOCR() {
       renderPages();
       try {
         let canvas = await preprocess(page.blob, Number(settings.maxSide) || 1800);
-        let prepared = await canvasToBlob(canvas);
 
-        const rotation = await detectOrientation(worker, prepared);
+        const rotation = await probeOrientation(canvas);
         if (rotation) {
-          prepared = await rotateBlob(prepared, rotation);
-          canvas = await blobToCanvas(prepared);
+          state.progressLabel = `${state.progressLabel} · поворот ${rotation}°`;
+          canvas = rotateCanvasAny(canvas, rotation);
         }
         canvas = deskewCanvas(canvas);
-        prepared = await canvasToBlob(canvas);
 
-        const { data } = await worker.recognize(prepared, {}, { blocks: true, text: true });
-        page.paragraphs = extractParagraphs(data);
+        setProgress((done + 0.5) / todo.length, `${state.progressLabel} · распознавание`);
+        const result = await PaddleEngine.recognizeCanvas(canvas);
+
+        page.paragraphs = paragraphsFromLines(result.lines);
         page.text = page.paragraphs.map((p) => p.lines.join('\n')).join('\n\n');
-        page.conf = typeof data.confidence === 'number' ? data.confidence : 0;
+        page.conf = Math.round((result.meanScore || 0) * 100);
         page.status = page.text.trim() ? 'done' : 'error';
         if (!page.text.trim()) page.error = 'текст не найден';
       } catch (err) {
@@ -1055,7 +1019,6 @@ function openResult() {
 /* Настройки                                                           */
 /* ------------------------------------------------------------------ */
 function openSettings() {
-  $('#setLangs').value = settings.langs;
   $('#setMaxSide').value = String(settings.maxSide);
   $('#setSpeller').value = settings.speller;
   $('#setMail').value = settings.mail;
@@ -1065,7 +1028,6 @@ function openSettings() {
 
 function saveSettingsFromDialog() {
   const next = {
-    langs: $('#setLangs').value,
     maxSide: Number($('#setMaxSide').value),
     speller: $('#setSpeller').value,
     mail: $('#setMail').value,
@@ -1073,11 +1035,6 @@ function saveSettingsFromDialog() {
   };
   Object.assign(settings, next);
   saveSettings();
-  if (state.workerLangs && state.workerLangs !== settings.langs) {
-    state.worker.terminate().catch(() => {});
-    state.worker = null;
-    state.workerLangs = null;
-  }
   toast('Настройки сохранены');
 }
 

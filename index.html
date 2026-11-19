@@ -100,14 +100,10 @@
   <form method="dialog" class="settings">
     <h2>Настройки</h2>
 
-    <label class="field">
-      <span>Языки распознавания</span>
-      <select id="setLangs">
-        <option value="rus+eng">Русский + английский</option>
-        <option value="rus">Только русский</option>
-        <option value="eng">Только английский</option>
-      </select>
-    </label>
+    <div class="field">
+      <span>Движок распознавания</span>
+      <div class="engine-note">PaddleOCR PP-OCRv5 · русский + английский · работает на телефоне</div>
+    </div>
 
     <label class="field">
       <span>Длинная сторона фото при распознавании</span>
@@ -152,7 +148,8 @@
 
 <div id="toast" class="toast" hidden></div>
 
-<script src="vendor/tesseract.min.js"></script>
+<script src="vendor/ort/ort.wasm.min.js"></script>
+<script src="paddle-engine.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
