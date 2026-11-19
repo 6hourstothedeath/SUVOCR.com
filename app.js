@@ -744,7 +744,11 @@ function medianOf(values) {
 /* строки страницы: ячейки, выровненные по вертикали */
 function rowsFromLines(lines) {
   const items = (lines || [])
-    .map((l) => ({ text: String(l.t || '').replace(/\s+/g, ' ').trim(), x0: l.b[0], y0: l.b[1], x1: l.b[2], y1: l.b[3] }))
+    .map((l) => ({
+      text: String(l.t || '').replace(/\s+/g, ' ').trim(),
+      x0: l.b[0], y0: l.b[1], x1: l.b[2], y1: l.b[3],
+      ref: l,
+    }))
     .filter((i) => i.text && i.x1 > i.x0);
   if (!items.length) return [];
 
@@ -773,41 +777,36 @@ function rowsFromLines(lines) {
   return rows;
 }
 
-/* похоже ли содержимое страницы на таблицу */
-function looksLikeTable(rows) {
-  if (rows.length < 4) return false;
-  const multi = rows.filter((r) => r.cells.length >= 2).length;
-  if (multi / rows.length >= 0.45) return true;
-
-  let run = 0;
-  for (const row of rows) {
-    run = row.cells.length >= 3 ? run + 1 : 0;
-    if (run >= 3) return true;
-  }
-  return false;
-}
-
 /* раскладываем ячейки по колонкам, сохраняя конфигурацию таблицы */
 function gridFromRows(rows, lineHeight) {
+  const tol = Math.max(16, lineHeight * 0.8);
   const starts = [];
   for (const row of rows) for (const cell of row.cells) starts.push(cell.x0);
   starts.sort((a, b) => a - b);
 
-  const cols = [];
+  const clusters = [];
   for (const x of starts) {
-    if (!cols.length || x - cols[cols.length - 1] > lineHeight * 1.2) cols.push(x);
+    const last = clusters[clusters.length - 1];
+    if (last && x - last.sum / last.n <= tol) {
+      last.sum += x;
+      last.n += 1;
+    } else {
+      clusters.push({ sum: x, n: 1 });
+    }
   }
+  const centers = clusters.map((c) => c.sum / c.n).slice(0, 14);
 
   const grid = rows.map((row) => {
-    const cells = new Array(cols.length).fill('');
+    const cells = new Array(centers.length).fill('');
     for (const cell of row.cells) {
-      let best = 0;
+      // привязываем по левому краю: широкие строки-заголовки иначе «уезжают» вправо
+      let idx = 0;
       let bestDist = Infinity;
-      for (let i = 0; i < cols.length; i++) {
-        const d = Math.abs(cell.x0 - cols[i]);
-        if (d < bestDist) { bestDist = d; best = i; }
+      for (let i = 0; i < centers.length; i++) {
+        const d = Math.abs(cell.x0 - centers[i]);
+        if (d < bestDist) { bestDist = d; idx = i; }
       }
-      cells[best] = cells[best] ? `${cells[best]} ${cell.text}` : cell.text;
+      cells[idx] = cells[idx] ? `${cells[idx]} ${cell.text}` : cell.text;
     }
     return cells;
   });
@@ -820,7 +819,39 @@ function gridFromRows(rows, lineHeight) {
   });
 }
 
-/* собираем листы: таблица — сеткой, текст — по абзацу в ячейке */
+/* страница целиком похожа на таблицу? Сетку рисуем только тогда,
+ * иначе разметка «съезжает» и текст уходит по абзацам в ячейки. */
+function pageIsTable(rows) {
+  if (rows.length < 5) return false;
+  const multi = rows.filter((row) => row.cells.length >= 2).length;
+  if (multi / rows.length < 0.6) return false;
+
+  const counts = {};
+  for (const row of rows) {
+    if (row.cells.length >= 2) counts[row.cells.length] = (counts[row.cells.length] || 0) + 1;
+  }
+  const mode = Math.max(...Object.values(counts));
+  return mode / multi >= 0.5;
+}
+
+/* длинный абзац режем по предложениям, чтобы ячейка оставалась читаемой */
+function splitLongText(text, max = 400) {
+  if (text.length <= max) return [text];
+  const parts = [];
+  let rest = text;
+  while (rest.length > max) {
+    let cut = rest.lastIndexOf('. ', max);
+    if (cut < max * 0.5) cut = rest.lastIndexOf(' ', max);
+    if (cut <= 0) cut = max;
+    parts.push(rest.slice(0, cut + 1).trim());
+    rest = rest.slice(cut + 1).trim();
+  }
+  if (rest) parts.push(rest);
+  return parts.filter(Boolean);
+}
+
+/* Листы: чистая таблица — сеткой, всё остальное — по абзацу в ячейке,
+ * каждая новая страница начинается с новой строки. */
 function buildSheets() {
   const textRows = [];
   const tableRows = [];
@@ -829,17 +860,25 @@ function buildSheets() {
   for (const page of state.pages) {
     if (page.status !== 'done') continue;
 
-    const paragraphs = (page.paragraphs || []).map((p) => p.lines.join(' ').trim()).filter(Boolean);
     const rows = rowsFromLines(page.lines || []);
     const lineHeight = medianOf((page.lines || []).map((l) => l.b[3] - l.b[1])) || 20;
 
-    if (rows.length && looksLikeTable(rows)) {
+    if (rows.length && pageIsTable(rows)) {
       tablePages++;
       if (tableRows.length) tableRows.push([]);
       tableRows.push(...gridFromRows(rows, lineHeight));
-      continue;   // таблица уже содержит весь текст страницы построчно
+      continue;
     }
-    for (const text of paragraphs) textRows.push([text]);
+
+    const paragraphs = (page.paragraphs || [])
+      .map((p) => p.lines.join(' ').trim())
+      .filter(Boolean);
+    if (!paragraphs.length) continue;
+
+    if (textRows.length) textRows.push(['']);   // новая страница — с новой строки
+    for (const paragraph of paragraphs) {
+      for (const chunk of splitLongText(paragraph)) textRows.push([chunk]);
+    }
   }
 
   const sheets = [];
